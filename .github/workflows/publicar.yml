@@ -1,10 +1,11 @@
 name: Publicar Warex
 
 # Publica una versión nueva de Warex para escritorio: baja el código del repositorio privado
-# AntonioEspana/Warex, construye el instalador de Windows firmado para el actualizador y lo sube con su
-# latest.json a una release de este repositorio. Las aplicaciones instaladas lo ven al abrirse y se
-# actualizan solas (desktop/src-tauri/src/client_update.rs en Warex). Va aquí y no en Warex porque en un
-# repositorio público los minutos de Actions son gratis.
+# AntonioEspana/Warex, construye a la vez el instalador de Windows y los de Linux (.deb y AppImage), firmados
+# para el actualizador, y los sube con un solo latest.json a una release de este repositorio. Las aplicaciones
+# instaladas lo ven al abrirse y se actualizan solas, cada una con su tipo de paquete
+# (desktop/src-tauri/src/client_update.rs en Warex). Va aquí y no en Warex porque en un repositorio público los
+# minutos de Actions son gratis. Si falla una de las compilaciones no se publica nada.
 #
 # Solo se lanza a mano (Actions → Publicar Warex → Run workflow), con la versión nueva, más alta que la
 # anterior. Necesita, en Settings → Secrets and variables → Actions de este repositorio:
@@ -33,33 +34,53 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    name: Instalador de Windows y latest.json
-    runs-on: windows-latest
-    timeout-minutes: 40
+  check:
+    name: Comprobar la versión y los secretos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - env:
+          CODE_TOKEN: ${{ secrets.WAREX_CODE_TOKEN }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::La versión tiene que ser como 1.2.3"; exit 1; }
+          [ -n "$CODE_TOKEN" ] || { echo "::error::Falta el secreto WAREX_CODE_TOKEN"; exit 1; }
+          [ -n "$SIGNING_KEY" ] || { echo "::error::Falta el secreto TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
+          if gh release view "escritorio-v$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::La versión $VERSION ya está publicada"; exit 1
+          fi
+
+  build:
+    name: Instaladores de ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            bundles: nsis
+            files: nsis/Warex_*_x64-setup.exe
+          # 22.04 y no la última: un AppImage solo funciona con una glibc igual o más nueva que la de donde se
+          # construyó, así que cuanto más antigua, en más distribuciones arranca.
+          - name: Linux
+            runner: ubuntu-22.04
+            bundles: deb,appimage
+            files: deb/Warex_*_amd64.deb appimage/Warex_*_amd64.AppImage
     defaults:
       run:
         working-directory: warex/desktop
         shell: bash
     env:
       VERSION: ${{ inputs.version }}
-      NOTES: ${{ inputs.notes }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
-      - name: Comprobar la versión y los secretos
-        working-directory: .
-        env:
-          CODE_TOKEN: ${{ secrets.WAREX_CODE_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::La versión tiene que ser como 1.2.3"; exit 1; }
-          [ -n "$CODE_TOKEN" ] || { echo "::error::Falta el secreto WAREX_CODE_TOKEN"; exit 1; }
-          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::Falta el secreto TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
-          if gh release view "escritorio-v$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::error::La versión $VERSION ya está publicada"; exit 1
-          fi
-
       - uses: actions/checkout@v4
         with:
           repository: AntonioEspana/Warex
@@ -72,6 +93,22 @@ jobs:
         run: |
           node -e 'process.exit(require("./src-tauri/tauri.conf.json").plugins.updater.pubkey ? 0 : 1)' \
             || { echo "::error::Falta la clave pública en plugins.updater.pubkey de tauri.conf.json"; exit 1; }
+
+      # apt a veces se queda colgado en los runners: cada intento tiene tiempo límite y se reintenta.
+      - name: Bibliotecas de sistema de Tauri
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: |
+          apt="sudo apt-get -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          for attempt in 1 2 3; do
+            if timeout 240 $apt update && timeout 240 $apt install -y \
+                libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev file; then
+              exit 0
+            fi
+            echo "::warning::apt no terminó (intento $attempt de 3)"
+            sleep 10
+          done
+          exit 1
 
       - uses: actions/setup-node@v4
         with:
@@ -88,17 +125,67 @@ jobs:
       - run: npm ci
 
       # La versión sale de aquí y no de tauri.conf.json, así que no hace falta subirla en el código.
-      - name: Construir el instalador firmado
-        run: npm run tauri build -- --bundles nsis --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":true}}"
+      - name: Construir los instaladores firmados
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":true}}"
+
+      - name: Reunir los instaladores y sus firmas
+        working-directory: warex/desktop/src-tauri/target/release/bundle
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/salida"
+          for file in ${{ matrix.files }}; do
+            [ -f "$file" ] && [ -f "$file.sig" ] || { echo "::error::Falta $file o su firma"; exit 1; }
+            cp "$file" "$file.sig" "$GITHUB_WORKSPACE/salida/"
+          done
+          ls -l "$GITHUB_WORKSPACE/salida"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instaladores-${{ matrix.name }}
+          path: salida/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publicar la release y el latest.json
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+      NOTES: ${{ inputs.notes }}
+    steps:
+      # Solo hace falta el script que escribe el latest.json.
+      - uses: actions/checkout@v4
+        with:
+          repository: AntonioEspana/Warex
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.WAREX_CODE_TOKEN }}
+          path: warex
+          persist-credentials: false
+          sparse-checkout: desktop/scripts
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: instaladores-*
+          path: salida
+          merge-multiple: true
 
       - name: Publicar la release
+        working-directory: salida
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="escritorio-v$VERSION"
-          installer="src-tauri/target/release/bundle/nsis/Warex_${VERSION}_x64-setup.exe"
-          url="https://github.com/${{ github.repository }}/releases/download/$tag/Warex_${VERSION}_x64-setup.exe"
-          node scripts/latest-json.mjs "$VERSION" "$installer" "$url" "$NOTES" > latest.json
+          base="https://github.com/${{ github.repository }}/releases/download/$tag"
+          windows="Warex_${VERSION}_x64-setup.exe"
+          deb="Warex_${VERSION}_amd64.deb"
+          appimage="Warex_${VERSION}_amd64.AppImage"
+          node ../warex/desktop/scripts/latest-json.mjs "$VERSION" --notes "$NOTES" \
+            --platform windows-x86_64 "$windows" "$base/$windows" \
+            --platform linux-x86_64-deb "$deb" "$base/$deb" \
+            --platform linux-x86_64-appimage "$appimage" "$base/$appimage" > latest.json
           cat latest.json
-          gh release create "$tag" "$installer" "$installer.sig" latest.json --repo "${{ github.repository }}" \
-            --title "Warex $VERSION para escritorio" --notes "${NOTES:-Warex $VERSION para escritorio.}" --latest
+          gh release create "$tag" "$windows" "$windows.sig" "$deb" "$deb.sig" "$appimage" "$appimage.sig" latest.json \
+            --repo "${{ github.repository }}" --title "Warex $VERSION para escritorio" \
+            --notes "${NOTES:-Warex $VERSION para escritorio.}" --latest
