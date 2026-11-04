@@ -18,9 +18,9 @@ on:
         description: "Versión nueva, p. ej. 0.2.0"
         required: true
       notes:
-        description: "Qué trae (opcional)"
-        required: false
-        default: ""
+        # La aplicación las enseña al pulsar el aviso de versión nueva (pauta D-08 del manual de calidad).
+        description: "Qué cambia, en una o dos frases para el jugador (p. ej. «Chat de voz en los grupos y descargas más rápidas»)"
+        required: true
       ref:
         description: "Rama o commit de Warex que se publica"
         required: false
@@ -188,4 +188,4 @@ jobs:
           cat latest.json
           gh release create "$tag" "$windows" "$windows.sig" "$deb" "$deb.sig" "$appimage" "$appimage.sig" latest.json \
             --repo "${{ github.repository }}" --title "Warex $VERSION para escritorio" \
-            --notes "${NOTES:-Warex $VERSION para escritorio.}" --latest
+            --notes "$NOTES" --latest
